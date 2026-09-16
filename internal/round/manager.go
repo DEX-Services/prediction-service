@@ -126,6 +126,15 @@ func (m *Manager) commitNextWindow(ctx context.Context, market models.Market, du
 	return err
 }
 
+// revealGracePeriod bounds how long a committed window waits for a fresh
+// price before revealing anyway with the last-known (stale) price rather
+// than retrying silently forever. Without this, a genuine upstream feed gap
+// at the exact moment of rollover could leave a round stuck in "committed"
+// indefinitely — no ticks are ever broadcast for a committed window (see
+// broadcastTicks), so the frontend would show nothing but a placeholder
+// with no way to tell the difference between "about to open" and "stuck".
+const revealGracePeriod = 5 * time.Second
+
 func (m *Manager) openDueCommits(ctx context.Context, now time.Time) error {
 	windows, err := m.repo.DueCommits(ctx, now)
 	if err != nil {
@@ -134,8 +143,15 @@ func (m *Manager) openDueCommits(ctx context.Context, now time.Time) error {
 	for _, w := range windows {
 		snap := m.prices.Get(ctx, string(w.Market), now.UnixMilli())
 		if !snap.Fresh {
-			// Price feed not ready yet; try again next tick.
-			continue
+			waited := now.Sub(w.CommitTime)
+			if waited < revealGracePeriod || !snap.Price.IsPositive() {
+				// Still within the normal reveal window, or there's no
+				// price at all to fall back to (feed genuinely never
+				// published this asset) — keep retrying next tick.
+				m.log.Warn("price feed stale at reveal time, retrying", "window_id", w.ID, "market", w.Market, "waited", waited, "has_fallback_price", snap.Price.IsPositive())
+				continue
+			}
+			m.log.Warn("revealing with stale price after grace period", "window_id", w.ID, "market", w.Market, "waited", waited, "price_age_ms", snap.AgeMs)
 		}
 
 		target := snap.Price.Add(snap.Price.Mul(decimal.NewFromInt(w.OffsetBps).Div(decimal.NewFromInt(10000))))
