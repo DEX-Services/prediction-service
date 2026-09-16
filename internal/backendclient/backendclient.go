@@ -69,6 +69,40 @@ func New() (*Client, error) {
 	}, nil
 }
 
+type ensureUserReq struct {
+	UserID string `json:"userId"`
+}
+
+// EnsureUser calls POST /internal/user/ensure — guarantees a users row
+// exists for userID before this service locks/credits real balances
+// against it. Dex-Backend only creates that row automatically at wallet
+// login (Server.Login's FindOrCreate); a valid JWT can otherwise exist
+// without one (e.g. the admin panel's session, which never calls
+// FindOrCreate), and locking funds for a userID with no users row fails
+// user_balances' foreign key. Idempotent — safe to call on every order.
+func (c *Client) EnsureUser(ctx context.Context, userID string) error {
+	body, err := json.Marshal(ensureUserReq{UserID: userID})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/user/ensure", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Engine-Secret", c.secret)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("backendclient /internal/user/ensure: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("backendclient /internal/user/ensure: status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
 type balanceReq struct {
 	UserID string `json:"userId"`
 	Asset  string `json:"asset"`

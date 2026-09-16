@@ -50,6 +50,10 @@ func opposite(s models.OrderSide) models.OrderSide {
 // p + q >= 1 (i.e. q >= 1-p): the resting order's price is what the trade
 // executes at, giving price-time priority to whoever was there first.
 func (m *Matcher) PlaceOrder(ctx context.Context, o *models.Order) (int64, []*models.Fill, error) {
+	if err := m.client.EnsureUser(ctx, o.UserID); err != nil {
+		return 0, nil, fmt.Errorf("ensure user: %w", err)
+	}
+
 	cost := o.Price.Mul(o.Size)
 	if o.Side == models.SideNo {
 		cost = decimal.NewFromInt(1).Sub(o.Price).Mul(o.Size)
