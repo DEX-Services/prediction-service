@@ -1,0 +1,5 @@
+.env
+kafka-ca.pem
+
+# macOS
+.DS_Store
