@@ -225,6 +225,41 @@ func (r *Repo) GetOrder(ctx context.Context, id int64) (*models.Order, error) {
 	return scanOrder(row)
 }
 
+// BookLevel is one aggregated price level of a window's public order book —
+// individual orders/users are never exposed here, only price+total size.
+type BookLevel struct {
+	Price string
+	Size  string
+}
+
+// AggregatedBook returns the public order book for one side of a window,
+// aggregated by price (best price first) with per-user identity stripped —
+// safe to expose to any client, unlike OpposingBook's per-order view used
+// internally by the matcher.
+func (r *Repo) AggregatedBook(ctx context.Context, windowID int64, side models.OrderSide) ([]BookLevel, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT price, SUM(size - filled_size) AS remaining
+		FROM prediction_orders
+		WHERE window_id = $1 AND side = $2 AND status = 'open'
+		GROUP BY price
+		HAVING SUM(size - filled_size) > 0
+		ORDER BY price DESC
+	`, windowID, side)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BookLevel
+	for rows.Next() {
+		var level BookLevel
+		if err := rows.Scan(&level.Price, &level.Size); err != nil {
+			return nil, err
+		}
+		out = append(out, level)
+	}
+	return out, rows.Err()
+}
+
 // OpposingBook returns resting (open, unfilled) orders on the opposite side
 // of a window's book, best price first (highest price for the side being
 // bought against, i.e. price-time priority), for matching an incoming order.

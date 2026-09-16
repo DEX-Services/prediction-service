@@ -35,6 +35,8 @@ func NewServer(r *repo.Repo, matcher *round.Matcher, jwt *auth.JWTIssuer, hub *w
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /prediction/windows", s.handleActiveWindows)
+	mux.HandleFunc("GET /prediction/windows/{id}", s.handleGetWindow)
+	mux.HandleFunc("GET /prediction/book", s.handleOrderBook)
 	mux.HandleFunc("POST /prediction/orders", s.handlePlaceOrder)
 	mux.HandleFunc("POST /prediction/orders/{id}/cancel", s.handleCancelOrder)
 	mux.HandleFunc("GET /prediction/orders", s.handleUserOrders)
@@ -69,18 +71,37 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-func (s *Server) handleActiveWindows(w http.ResponseWriter, r *http.Request) {
-	type windowView struct {
-		ID           int64  `json:"id"`
-		Market       string `json:"market"`
-		Duration     string `json:"duration"`
-		Status       string `json:"status"`
-		OpeningPrice string `json:"openingPrice,omitempty"`
-		TargetPrice  string `json:"targetPrice,omitempty"`
-		CommitHash   string `json:"commitHash"`
-		StartTime    string `json:"startTime"`
-		EndTime      string `json:"endTime"`
+type windowView struct {
+	ID              int64  `json:"id"`
+	Market          string `json:"market"`
+	Duration        string `json:"duration"`
+	Status          string `json:"status"`
+	OpeningPrice    string `json:"openingPrice,omitempty"`
+	TargetPrice     string `json:"targetPrice,omitempty"`
+	ResolutionPrice string `json:"resolutionPrice,omitempty"`
+	CommitHash      string `json:"commitHash"`
+	StartTime       string `json:"startTime"`
+	EndTime         string `json:"endTime"`
+}
+
+func toWindowView(win *models.Window) windowView {
+	v := windowView{
+		ID: win.ID, Market: string(win.Market), Duration: string(win.Duration),
+		Status: string(win.Status), CommitHash: win.CommitHash,
+		StartTime: win.StartTime.Format("2006-01-02T15:04:05Z07:00"),
+		EndTime:   win.EndTime.Format("2006-01-02T15:04:05Z07:00"),
 	}
+	if win.Status != models.WindowCommitted {
+		v.OpeningPrice = win.OpeningPrice.Decimal.String()
+		v.TargetPrice = win.TargetPrice.Decimal.String()
+	}
+	if win.Status == models.WindowSettled {
+		v.ResolutionPrice = win.ResolutionPrice.Decimal.String()
+	}
+	return v
+}
+
+func (s *Server) handleActiveWindows(w http.ResponseWriter, r *http.Request) {
 	markets := []models.Market{models.MarketBTC, models.MarketETH, models.MarketSOL}
 	durations := []models.Duration{models.Duration5m, models.Duration15m}
 	var out []windowView
@@ -90,20 +111,58 @@ func (s *Server) handleActiveWindows(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			v := windowView{
-				ID: win.ID, Market: string(win.Market), Duration: string(win.Duration),
-				Status: string(win.Status), CommitHash: win.CommitHash,
-				StartTime: win.StartTime.Format("2006-01-02T15:04:05Z07:00"),
-				EndTime:   win.EndTime.Format("2006-01-02T15:04:05Z07:00"),
-			}
-			if win.Status != models.WindowCommitted {
-				v.OpeningPrice = win.OpeningPrice.Decimal.String()
-				v.TargetPrice = win.TargetPrice.Decimal.String()
-			}
-			out = append(out, v)
+			out = append(out, toWindowView(win))
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleGetWindow returns one window by id regardless of status — used by
+// the frontend to label historical orders/positions against a settled
+// round that's no longer any market's "active" window.
+func (s *Server) handleGetWindow(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid window id")
+		return
+	}
+	win, err := s.repo.GetWindow(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "window not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, toWindowView(win))
+}
+
+type bookLevelView struct {
+	Price string `json:"price"`
+	Size  string `json:"size"`
+}
+
+func (s *Server) handleOrderBook(w http.ResponseWriter, r *http.Request) {
+	windowID, err := strconv.ParseInt(r.URL.Query().Get("windowId"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid or missing windowId")
+		return
+	}
+	yes, err := s.repo.AggregatedBook(r.Context(), windowID, models.SideYes)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load order book")
+		return
+	}
+	no, err := s.repo.AggregatedBook(r.Context(), windowID, models.SideNo)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load order book")
+		return
+	}
+	toView := func(levels []repo.BookLevel) []bookLevelView {
+		out := make([]bookLevelView, len(levels))
+		for i, l := range levels {
+			out[i] = bookLevelView{Price: l.Price, Size: l.Size}
+		}
+		return out
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"yes": toView(yes), "no": toView(no)})
 }
 
 type placeOrderReq struct {
