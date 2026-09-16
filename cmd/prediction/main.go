@@ -86,9 +86,10 @@ func main() {
 	}()
 
 	server := api.NewServer(r, matcher, jwtIssuer, hub, log)
+	corsOrigins := os.Getenv("WS_ALLOWED_ORIGINS")
 	httpServer := &http.Server{
 		Addr:    ":" + port,
-		Handler: server.Routes(),
+		Handler: api.CORS(corsOrigins, server.Routes()),
 	}
 
 	go func() {
