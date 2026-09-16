@@ -39,6 +39,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /prediction/book", s.handleOrderBook)
 	mux.HandleFunc("POST /prediction/orders", s.handlePlaceOrder)
 	mux.HandleFunc("POST /prediction/orders/{id}/cancel", s.handleCancelOrder)
+	mux.HandleFunc("POST /prediction/positions/sell", s.handleSellPosition)
 	mux.HandleFunc("GET /prediction/orders", s.handleUserOrders)
 	mux.HandleFunc("GET /prediction/positions", s.handleUserPositions)
 	mux.HandleFunc("GET /prediction/ws", s.hub.ServeWS)
@@ -221,6 +222,64 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 		"filledSize": order.FilledSize.String(),
 		"status":     order.Status,
 		"fillCount":  len(fills),
+	})
+}
+
+type sellPositionReq struct {
+	WindowID int64  `json:"windowId"`
+	Side     string `json:"side"`
+	Size     string `json:"size"`
+	// MinPrice is the lowest price (in YES-probability terms for the side
+	// being sold) the user accepts for the closed portion — protects against
+	// selling into a much worse price than the last quoted one. Required.
+	MinPrice string `json:"minPrice"`
+}
+
+func (s *Server) handleSellPosition(w http.ResponseWriter, r *http.Request) {
+	claims, err := s.authenticate(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req sellPositionReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	side := models.OrderSide(req.Side)
+	if side != models.SideYes && side != models.SideNo {
+		writeError(w, http.StatusBadRequest, "side must be 'yes' or 'no'")
+		return
+	}
+	size, err := decimal.NewFromString(req.Size)
+	if err != nil || size.LessThanOrEqual(decimal.Zero) {
+		writeError(w, http.StatusBadRequest, "invalid size")
+		return
+	}
+	minPrice, err := decimal.NewFromString(req.MinPrice)
+	if err != nil || minPrice.LessThanOrEqual(decimal.Zero) || minPrice.GreaterThanOrEqual(decimal.NewFromInt(1)) {
+		writeError(w, http.StatusBadRequest, "minPrice must be between 0 and 1")
+		return
+	}
+
+	win, err := s.repo.GetWindow(r.Context(), req.WindowID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "window not found")
+		return
+	}
+	if win.Status != models.WindowOpen {
+		writeError(w, http.StatusConflict, "window is not open for trading")
+		return
+	}
+
+	orderID, filled, err := s.matcher.Sell(r.Context(), req.WindowID, claims.UserID, side, size, minPrice)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"orderId":    orderID,
+		"filledSize": filled.String(),
 	})
 }
 

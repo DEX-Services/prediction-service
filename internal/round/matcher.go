@@ -191,6 +191,47 @@ func (m *Matcher) settleFill(ctx context.Context, tx pgx.Tx, taker, maker *model
 	})
 }
 
+// Sell closes up to size shares of a user's existing side position before
+// resolution. There is no separate "ask" order type — selling N shares of
+// YES is economically identical to buying N shares of NO (holding equal
+// YES and NO is a fully hedged position worth exactly $1/share regardless
+// of outcome), so this places a real order on the opposite side, matches it
+// through the normal book, then nets down both sides by however much
+// actually filled. Any unfilled remainder simply rests on the book as a
+// normal opposite-side order — the user still holds their original
+// position for that portion, unhedged, exactly as if they'd placed that
+// order directly.
+func (m *Matcher) Sell(ctx context.Context, windowID int64, userID string, side models.OrderSide, size, limitPrice decimal.Decimal) (int64, decimal.Decimal, error) {
+	position, err := m.repo.GetPosition(ctx, windowID, userID, side)
+	if err != nil {
+		return 0, decimal.Zero, fmt.Errorf("no position to sell: %w", err)
+	}
+	if size.GreaterThan(position.Shares) {
+		return 0, decimal.Zero, fmt.Errorf("cannot sell %s shares, only %s held", size, position.Shares)
+	}
+
+	hedgeSide := opposite(side)
+	hedgePrice := limitPrice
+	if side == models.SideYes {
+		hedgePrice = decimal.NewFromInt(1).Sub(limitPrice)
+	}
+
+	hedgeOrder := &models.Order{WindowID: windowID, UserID: userID, Side: hedgeSide, Price: hedgePrice, Size: size}
+	orderID, _, err := m.PlaceOrder(ctx, hedgeOrder)
+	if err != nil {
+		return 0, decimal.Zero, err
+	}
+
+	if hedgeOrder.FilledSize.GreaterThan(decimal.Zero) {
+		if err := m.repo.WithTx(ctx, func(tx pgx.Tx) error {
+			return m.repo.NetPositions(ctx, tx, windowID, userID, hedgeOrder.FilledSize)
+		}); err != nil {
+			return orderID, decimal.Zero, fmt.Errorf("net positions after sell: %w", err)
+		}
+	}
+	return orderID, hedgeOrder.FilledSize, nil
+}
+
 // CancelOrder cancels a resting order and unlocks its unfilled remainder.
 func (m *Matcher) CancelOrder(ctx context.Context, orderID int64, userID string, side models.OrderSide, price decimal.Decimal) error {
 	remaining, err := m.repo.CancelUserOrder(ctx, orderID, userID)

@@ -410,6 +410,31 @@ func (r *Repo) PositionsForWindow(ctx context.Context, windowID int64) ([]*model
 	return out, rows.Err()
 }
 
+// GetPosition returns a user's position for one window+side, or ErrNotFound
+// if they hold none.
+func (r *Repo) GetPosition(ctx context.Context, windowID int64, userID string, side models.OrderSide) (*models.Position, error) {
+	row := r.pool.QueryRow(ctx, `SELECT `+positionCols+` FROM prediction_positions WHERE window_id = $1 AND user_id = $2 AND side = $3`, windowID, userID, side)
+	return scanPosition(row)
+}
+
+// NetPositions reduces a user's opposing YES and NO holdings in a window by
+// min(yesShares, noShares) — the standard binary-market equivalence that
+// holding equal YES and NO shares is a fully hedged, closed position worth a
+// fixed $1-per-share regardless of outcome. This is how "selling" a position
+// is implemented: closing N shares of YES is done by acquiring N shares of
+// NO (see Matcher.Sell), then netting both down here instead of settling the
+// hedge at resolution. realizedDelta is added to both sides' Realized
+// column for bookkeeping/audit only; the actual cash movement happens via
+// backendclient.Credit in the caller, inside the same transaction.
+func (r *Repo) NetPositions(ctx context.Context, tx pgx.Tx, windowID int64, userID string, netShares decimal.Decimal) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE prediction_positions
+		SET shares = shares - $3, updated_at = now()
+		WHERE window_id = $1 AND user_id = $2 AND side IN ('yes', 'no')
+	`, windowID, userID, netShares)
+	return err
+}
+
 func (r *Repo) UserPositions(ctx context.Context, userID string, limit int) ([]*models.Position, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+positionCols+` FROM prediction_positions WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2
