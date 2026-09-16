@@ -77,16 +77,19 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 func (m *Manager) tick(ctx context.Context, now time.Time) {
-	if err := m.openDueCommits(ctx, now); err != nil {
-		m.log.Error("open due commits", "err", err)
+	step := func(name string, fn func() error) {
+		start := time.Now()
+		if err := fn(); err != nil {
+			m.log.Error(name, "err", err)
+		}
+		if d := time.Since(start); d > 500*time.Millisecond {
+			m.log.Warn("slow tick step", "step", name, "duration", d)
+		}
 	}
-	if err := m.lockDueWindows(ctx, now); err != nil {
-		m.log.Error("lock due windows", "err", err)
-	}
-	if err := m.settleLockedWindows(ctx, now); err != nil {
-		m.log.Error("settle locked windows", "err", err)
-	}
-	m.broadcastTicks(ctx, now)
+	step("open due commits", func() error { return m.openDueCommits(ctx, now) })
+	step("lock due windows", func() error { return m.lockDueWindows(ctx, now) })
+	step("settle locked windows", func() error { return m.settleLockedWindows(ctx, now) })
+	step("broadcast ticks", func() error { m.broadcastTicks(ctx, now); return nil })
 }
 
 // ensureActiveWindow creates a committed window for market/duration if none
