@@ -13,6 +13,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/dex/prediction-service/internal/backendclient"
+	"github.com/dex/prediction-service/internal/history"
 	"github.com/dex/prediction-service/internal/index"
 	"github.com/dex/prediction-service/internal/models"
 	"github.com/dex/prediction-service/internal/repo"
@@ -42,13 +43,14 @@ type Manager struct {
 	prices  *index.Reader
 	matcher *Matcher
 	client  *backendclient.Client
+	history *history.Store
 	log     *slog.Logger
 
 	onTick func(Tick)
 }
 
-func NewManager(r *repo.Repo, prices *index.Reader, matcher *Matcher, client *backendclient.Client, log *slog.Logger, onTick func(Tick)) *Manager {
-	return &Manager{repo: r, prices: prices, matcher: matcher, client: client, log: log, onTick: onTick}
+func NewManager(r *repo.Repo, prices *index.Reader, matcher *Matcher, client *backendclient.Client, hist *history.Store, log *slog.Logger, onTick func(Tick)) *Manager {
+	return &Manager{repo: r, prices: prices, matcher: matcher, client: client, history: hist, log: log, onTick: onTick}
 }
 
 // Start ensures all 6 market/duration streams have an active window, then
@@ -260,6 +262,17 @@ func (m *Manager) broadcastTicks(ctx context.Context, now time.Time) {
 				YesPrice: yes, NoPrice: decimal.NewFromInt(1).Sub(yes),
 				TimeRemaining: remaining, Status: w.Status,
 			})
+
+			if m.history != nil {
+				// TTL covers the remaining round time plus a few minutes so
+				// the history survives long enough for a "this round closed"
+				// screen to still show the final chart after lock/settle.
+				ttl := remaining + 5*time.Minute
+				point := history.Point{TimestampMs: now.UnixMilli(), CurrentPrice: snap.Price.String(), YesPrice: yes.String()}
+				if err := m.history.Append(ctx, w.ID, point, ttl); err != nil {
+					m.log.Error("append price history", "window_id", w.ID, "err", err)
+				}
+			}
 		}
 	}
 }

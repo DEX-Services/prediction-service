@@ -13,6 +13,7 @@ import (
 	"github.com/dex/prediction-service/internal/auth"
 	"github.com/dex/prediction-service/internal/backendclient"
 	"github.com/dex/prediction-service/internal/db"
+	"github.com/dex/prediction-service/internal/history"
 	"github.com/dex/prediction-service/internal/index"
 	"github.com/dex/prediction-service/internal/repo"
 	"github.com/dex/prediction-service/internal/round"
@@ -53,6 +54,13 @@ func main() {
 	}
 	defer priceReader.Close()
 
+	historyStore, err := history.New(ctx, redisURI)
+	if err != nil {
+		log.Error("history store connect", "err", err)
+		os.Exit(1)
+	}
+	defer historyStore.Close()
+
 	client, err := backendclient.New()
 	if err != nil {
 		log.Error("backend client", "err", err)
@@ -64,7 +72,7 @@ func main() {
 	hub := wshub.NewHub(log)
 	jwtIssuer := auth.NewJWTIssuer(jwtSecret, 24*time.Hour)
 
-	manager := round.NewManager(r, priceReader, matcher, client, log, func(t round.Tick) {
+	manager := round.NewManager(r, priceReader, matcher, client, historyStore, log, func(t round.Tick) {
 		hub.BroadcastJSON(map[string]any{
 			"type":          "tick",
 			"windowId":      t.WindowID,
@@ -85,7 +93,7 @@ func main() {
 		}
 	}()
 
-	server := api.NewServer(r, matcher, jwtIssuer, hub, log)
+	server := api.NewServer(r, matcher, jwtIssuer, hub, historyStore, log)
 	corsOrigins := os.Getenv("WS_ALLOWED_ORIGINS")
 	httpServer := &http.Server{
 		Addr:    ":" + port,

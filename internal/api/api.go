@@ -12,6 +12,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/dex/prediction-service/internal/auth"
+	"github.com/dex/prediction-service/internal/history"
 	"github.com/dex/prediction-service/internal/models"
 	"github.com/dex/prediction-service/internal/repo"
 	"github.com/dex/prediction-service/internal/round"
@@ -25,17 +26,19 @@ type Server struct {
 	matcher *round.Matcher
 	jwt     *auth.JWTIssuer
 	hub     *wshub.Hub
+	history *history.Store
 	log     *slog.Logger
 }
 
-func NewServer(r *repo.Repo, matcher *round.Matcher, jwt *auth.JWTIssuer, hub *wshub.Hub, log *slog.Logger) *Server {
-	return &Server{repo: r, matcher: matcher, jwt: jwt, hub: hub, log: log}
+func NewServer(r *repo.Repo, matcher *round.Matcher, jwt *auth.JWTIssuer, hub *wshub.Hub, hist *history.Store, log *slog.Logger) *Server {
+	return &Server{repo: r, matcher: matcher, jwt: jwt, hub: hub, history: hist, log: log}
 }
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /prediction/windows", s.handleActiveWindows)
 	mux.HandleFunc("GET /prediction/windows/{id}", s.handleGetWindow)
+	mux.HandleFunc("GET /prediction/history", s.handlePriceHistory)
 	mux.HandleFunc("GET /prediction/book", s.handleOrderBook)
 	mux.HandleFunc("POST /prediction/orders", s.handlePlaceOrder)
 	mux.HandleFunc("POST /prediction/orders/{id}/cancel", s.handleCancelOrder)
@@ -142,6 +145,33 @@ func (s *Server) handleGetWindow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toWindowView(win))
+}
+
+type historyPointView struct {
+	TimestampMs  int64  `json:"timestampMs"`
+	CurrentPrice string `json:"currentPrice"`
+	YesPrice     string `json:"yesPrice"`
+}
+
+// handlePriceHistory returns every recorded tick for a window since it
+// opened, so a browser opening the page mid-round can render the chart from
+// the round's actual start instead of building it up from page-open.
+func (s *Server) handlePriceHistory(w http.ResponseWriter, r *http.Request) {
+	windowID, err := strconv.ParseInt(r.URL.Query().Get("windowId"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid or missing windowId")
+		return
+	}
+	points, err := s.history.Get(r.Context(), windowID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load price history")
+		return
+	}
+	out := make([]historyPointView, len(points))
+	for i, p := range points {
+		out[i] = historyPointView{TimestampMs: p.TimestampMs, CurrentPrice: p.CurrentPrice, YesPrice: p.YesPrice}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type bookLevelView struct {
