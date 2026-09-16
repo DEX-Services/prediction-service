@@ -45,7 +45,10 @@ func (j *JWTIssuer) Verify(tokenString string) (*Claims, error) {
 		}
 		return j.secret, nil
 	})
-	if err != nil || !token.Valid {
+	if err != nil {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+	if !token.Valid {
 		return nil, fmt.Errorf("invalid token")
 	}
 	return claims, nil

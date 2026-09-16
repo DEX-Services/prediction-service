@@ -57,9 +57,18 @@ func (s *Server) authenticate(r *http.Request) (*auth.Claims, error) {
 		token = h[7:]
 	}
 	if token == "" {
+		s.log.Warn("authenticate: no token in cookie or Authorization header")
 		return nil, http.ErrNoCookie
 	}
-	return s.jwt.Verify(token)
+	claims, err := s.jwt.Verify(token)
+	if err != nil {
+		// Deliberately logs only the failure reason, never the token itself
+		// (it's a bearer credential) — this is diagnostic-only so a 401 from
+		// the frontend isn't a black box distinguishing "no token sent" from
+		// "token sent but rejected" from "signature/secret mismatch".
+		s.log.Warn("authenticate: token verify failed", "err", err)
+	}
+	return claims, err
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
