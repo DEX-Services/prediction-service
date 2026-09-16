@@ -132,6 +132,35 @@ func (r *Repo) ActiveWindow(ctx context.Context, market models.Market, duration 
 	return scanWindow(row)
 }
 
+// ActiveWindows returns the current active window for every market/duration
+// pair in one query, instead of one round-trip per pair (6 sequential
+// round-trips to a remote Postgres instance was the actual cause of
+// GET /prediction/windows taking anywhere from 0.7s to 5+s — any one of six
+// serialized network calls having a slow moment stalled the whole request).
+// DISTINCT ON (market, duration) with this ordering picks the same
+// highest-id row per pair that six separate ActiveWindow calls would have.
+func (r *Repo) ActiveWindows(ctx context.Context) ([]*models.Window, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT ON (market, duration) `+windowCols+`
+		FROM prediction_windows
+		WHERE status IN ('committed', 'open', 'locked')
+		ORDER BY market, duration, id DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*models.Window
+	for rows.Next() {
+		w, err := scanWindow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
 // DueWindows returns open windows whose end_time has passed, for the Round
 // Manager to lock.
 func (r *Repo) DueWindows(ctx context.Context, now time.Time) ([]*models.Window, error) {

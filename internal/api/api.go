@@ -115,17 +115,14 @@ func toWindowView(win *models.Window) windowView {
 }
 
 func (s *Server) handleActiveWindows(w http.ResponseWriter, r *http.Request) {
-	markets := []models.Market{models.MarketBTC, models.MarketETH, models.MarketSOL}
-	durations := []models.Duration{models.Duration5m, models.Duration15m}
-	var out []windowView
-	for _, market := range markets {
-		for _, duration := range durations {
-			win, err := s.repo.ActiveWindow(r.Context(), market, duration)
-			if err != nil {
-				continue
-			}
-			out = append(out, toWindowView(win))
-		}
+	windows, err := s.repo.ActiveWindows(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load windows")
+		return
+	}
+	out := make([]windowView, len(windows))
+	for i, win := range windows {
+		out[i] = toWindowView(win)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
