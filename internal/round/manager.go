@@ -236,6 +236,23 @@ func (m *Manager) lockDueWindows(ctx context.Context, now time.Time) error {
 			}
 			if err := m.client.Unlock(ctx, o.UserID, "BI2XUSD", backendclient.ToRawUnits(refund)); err != nil {
 				m.log.Error("unlock unfilled remainder", "order_id", o.ID, "err", err)
+				continue
+			}
+			// Mark the order cancelled now that its remainder is refunded —
+			// otherwise it stays "open" forever with no counterparty and no
+			// further chance to fill, which is indistinguishable from a
+			// genuinely live order to anything reading order status later
+			// (e.g. the frontend's order history, a future "your open
+			// orders" list).
+			newStatus := models.OrderCancelled
+			if o.FilledSize.IsPositive() {
+				// Partially filled: the matched portion still settles
+				// normally, so this isn't a full cancellation, but there's
+				// no unmatched remainder left to ever fill either.
+				newStatus = models.OrderFilled
+			}
+			if err := m.repo.CloseRefundedOrder(ctx, o.ID, newStatus); err != nil {
+				m.log.Error("mark refunded order terminal", "order_id", o.ID, "err", err)
 			}
 		}
 

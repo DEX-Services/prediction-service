@@ -343,6 +343,21 @@ func (r *Repo) CancelUserOrder(ctx context.Context, orderID int64, userID string
 	return remaining, err
 }
 
+// CloseRefundedOrder transitions an order out of "open" once its unfilled
+// remainder has been refunded at round lock — it never fills further, so
+// leaving it "open" would misrepresent it as still live to anything reading
+// order status later. newStatus is "cancelled" for a never-filled order or
+// "filled" for a partially-filled one whose remainder just got refunded
+// (its filled portion still settles normally; there's just no remainder
+// left to ever match).
+func (r *Repo) CloseRefundedOrder(ctx context.Context, orderID int64, newStatus models.OrderStatus) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE prediction_orders SET status = $2, updated_at = now()
+		WHERE id = $1 AND status = 'open'
+	`, orderID, newStatus)
+	return err
+}
+
 // OpenOrdersForWindow returns all still-open orders in a window, used at
 // lock time to refund unfilled remainders.
 func (r *Repo) OpenOrdersForWindow(ctx context.Context, windowID int64) ([]*models.Order, error) {
