@@ -17,6 +17,7 @@ import (
 	"github.com/dex/prediction-service/internal/index"
 	"github.com/dex/prediction-service/internal/models"
 	"github.com/dex/prediction-service/internal/repo"
+	"github.com/dex/prediction-service/internal/roundcache"
 )
 
 // Tick is a live pricing update for one window, broadcast every second.
@@ -44,13 +45,31 @@ type Manager struct {
 	matcher *Matcher
 	client  *backendclient.Client
 	history *history.Store
+	cache   *roundcache.Cache
 	log     *slog.Logger
 
 	onTick func(Tick)
 }
 
-func NewManager(r *repo.Repo, prices *index.Reader, matcher *Matcher, client *backendclient.Client, hist *history.Store, log *slog.Logger, onTick func(Tick)) *Manager {
-	return &Manager{repo: r, prices: prices, matcher: matcher, client: client, history: hist, log: log, onTick: onTick}
+func NewManager(r *repo.Repo, prices *index.Reader, matcher *Matcher, client *backendclient.Client, hist *history.Store, cache *roundcache.Cache, log *slog.Logger, onTick func(Tick)) *Manager {
+	return &Manager{repo: r, prices: prices, matcher: matcher, client: client, history: hist, cache: cache, log: log, onTick: onTick}
+}
+
+// refreshCache mirrors w's live-relevant state into Redis so broadcastTicks
+// can read it without touching Postgres. Best-effort: a failure here just
+// means the cache serves a stale/expired value next tick (skipped broadcast,
+// not a stall) rather than blocking any bookkeeping step.
+func (m *Manager) refreshCache(ctx context.Context, w *models.Window) {
+	if m.cache == nil {
+		return
+	}
+	cw := roundcache.Window{ID: w.ID, Status: w.Status, EndTime: w.EndTime}
+	if w.TargetPrice.Valid {
+		cw.TargetPrice = w.TargetPrice.Decimal
+	}
+	if err := m.cache.Set(ctx, w.Market, w.Duration, cw); err != nil {
+		m.log.Error("refresh round cache", "window_id", w.ID, "err", err)
+	}
 }
 
 // Start ensures all 6 market/duration streams have an active window, then
@@ -76,27 +95,44 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 }
 
+// tickStepTimeout bounds each bookkeeping step's worth of DB/HTTP work per
+// tick. A skipped tick (retried next second, since these steps are all
+// idempotent re-scans of "what's due now") is far better than a step that
+// blocks the whole per-second loop for 30+ seconds on one slow round-trip —
+// see PERFORMANCE-FIXES.md fix #1.
+const tickStepTimeout = 3 * time.Second
+
 func (m *Manager) tick(ctx context.Context, now time.Time) {
-	step := func(name string, fn func() error) {
+	step := func(name string, fn func(context.Context) error) {
+		stepCtx, cancel := context.WithTimeout(ctx, tickStepTimeout)
+		defer cancel()
 		start := time.Now()
-		if err := fn(); err != nil {
+		if err := fn(stepCtx); err != nil {
 			m.log.Error(name, "err", err)
 		}
 		if d := time.Since(start); d > 500*time.Millisecond {
 			m.log.Warn("slow tick step", "step", name, "duration", d)
 		}
 	}
-	step("open due commits", func() error { return m.openDueCommits(ctx, now) })
-	step("lock due windows", func() error { return m.lockDueWindows(ctx, now) })
-	step("settle locked windows", func() error { return m.settleLockedWindows(ctx, now) })
-	step("broadcast ticks", func() error { m.broadcastTicks(ctx, now); return nil })
+	step("open due commits", func(c context.Context) error { return m.openDueCommits(c, now) })
+	step("lock due windows", func(c context.Context) error { return m.lockDueWindows(c, now) })
+	step("settle locked windows", func(c context.Context) error { return m.settleLockedWindows(c, now) })
+	// broadcastTicks no longer touches Postgres (see its comment), so it
+	// doesn't need the same timeout treatment — Redis calls it does make are
+	// already fast and non-blocking for the other steps regardless.
+	step("broadcast ticks", func(c context.Context) error { m.broadcastTicks(c, now); return nil })
 }
 
 // ensureActiveWindow creates a committed window for market/duration if none
 // exists yet (first boot only; afterward the roll happens in openDueCommits).
+// It also seeds roundcache from the existing Postgres row on every boot —
+// without this, a restart would leave broadcastTicks blind for that
+// market/duration until its next reveal/lock/settle event happens to refresh
+// the cache naturally.
 func (m *Manager) ensureActiveWindow(ctx context.Context, market models.Market, duration models.Duration) error {
-	_, err := m.repo.ActiveWindow(ctx, market, duration)
+	w, err := m.repo.ActiveWindow(ctx, market, duration)
 	if err == nil {
+		m.refreshCache(ctx, w)
 		return nil
 	}
 	if !errors.Is(err, repo.ErrNotFound) {
@@ -162,6 +198,9 @@ func (m *Manager) openDueCommits(ctx context.Context, now time.Time) error {
 			m.log.Error("reveal window", "window_id", w.ID, "err", err)
 			continue
 		}
+		w.Status = models.WindowOpen
+		w.TargetPrice = decimal.NewNullDecimal(target)
+		m.refreshCache(ctx, w)
 	}
 	return nil
 }
@@ -176,6 +215,8 @@ func (m *Manager) lockDueWindows(ctx context.Context, now time.Time) error {
 			m.log.Error("lock window", "window_id", w.ID, "err", err)
 			continue
 		}
+		w.Status = models.WindowLocked
+		m.refreshCache(ctx, w)
 		// Refund every still-open (unfilled or partially-filled) order's
 		// unmatched remainder now that no more matching can happen — see
 		// the plan's unfilled-order risk callout.
@@ -227,6 +268,8 @@ func (m *Manager) settleLockedWindows(ctx context.Context, now time.Time) error 
 			m.log.Error("settle window", "window_id", w.ID, "err", err)
 			continue
 		}
+		w.Status = models.WindowSettled
+		m.refreshCache(ctx, w)
 
 		positions, err := m.repo.PositionsForWindow(ctx, w.ID)
 		if err != nil {
@@ -259,8 +302,13 @@ func (m *Manager) settleLockedWindows(ctx context.Context, now time.Time) error 
 	return nil
 }
 
+// broadcastTicks is the live path users actually notice stalling, so it
+// never calls Postgres: window state comes from roundcache (kept fresh by
+// openDueCommits/lockDueWindows/settleLockedWindows whenever it actually
+// changes), and a cache miss just skips that market/duration for one tick
+// instead of blocking every market behind a slow database round-trip.
 func (m *Manager) broadcastTicks(ctx context.Context, now time.Time) {
-	if m.onTick == nil {
+	if m.onTick == nil || m.cache == nil {
 		return
 	}
 	for _, market := range allMarkets {
@@ -269,15 +317,15 @@ func (m *Manager) broadcastTicks(ctx context.Context, now time.Time) {
 			continue
 		}
 		for _, duration := range allDurations {
-			w, err := m.repo.ActiveWindow(ctx, market, duration)
-			if err != nil || w.Status != models.WindowOpen {
+			w, ok := m.cache.Get(ctx, market, duration)
+			if !ok || w.Status != models.WindowOpen {
 				continue
 			}
 			remaining := w.EndTime.Sub(now)
-			yes := YesPrice(snap.Price, w.TargetPrice.Decimal, remaining, duration.Window())
+			yes := YesPrice(snap.Price, w.TargetPrice, remaining, duration.Window())
 			m.onTick(Tick{
 				WindowID: w.ID, Market: market, Duration: duration,
-				CurrentPrice: snap.Price, TargetPrice: w.TargetPrice.Decimal,
+				CurrentPrice: snap.Price, TargetPrice: w.TargetPrice,
 				YesPrice: yes, NoPrice: decimal.NewFromInt(1).Sub(yes),
 				TimeRemaining: remaining, Status: w.Status,
 			})

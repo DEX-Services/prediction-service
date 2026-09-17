@@ -17,6 +17,7 @@ import (
 	"github.com/dex/prediction-service/internal/index"
 	"github.com/dex/prediction-service/internal/repo"
 	"github.com/dex/prediction-service/internal/round"
+	"github.com/dex/prediction-service/internal/roundcache"
 	"github.com/dex/prediction-service/internal/wshub"
 
 	"github.com/joho/godotenv"
@@ -61,6 +62,13 @@ func main() {
 	}
 	defer historyStore.Close()
 
+	roundCache, err := roundcache.New(ctx, redisURI)
+	if err != nil {
+		log.Error("round cache connect", "err", err)
+		os.Exit(1)
+	}
+	defer roundCache.Close()
+
 	client, err := backendclient.New()
 	if err != nil {
 		log.Error("backend client", "err", err)
@@ -72,7 +80,7 @@ func main() {
 	hub := wshub.NewHub(log)
 	jwtIssuer := auth.NewJWTIssuer(jwtSecret, 24*time.Hour)
 
-	manager := round.NewManager(r, priceReader, matcher, client, historyStore, log, func(t round.Tick) {
+	manager := round.NewManager(r, priceReader, matcher, client, historyStore, roundCache, log, func(t round.Tick) {
 		hub.BroadcastJSON(map[string]any{
 			"type":          "tick",
 			"windowId":      t.WindowID,
