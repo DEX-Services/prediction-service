@@ -322,7 +322,7 @@ func (m *Manager) broadcastTicks(ctx context.Context, now time.Time) {
 				continue
 			}
 			remaining := w.EndTime.Sub(now)
-			yes := YesPrice(snap.Price, w.TargetPrice, remaining, duration.Window())
+			yes := YesPrice(snap.Price, w.TargetPrice, remaining, duration.Window(), duration)
 			m.onTick(Tick{
 				WindowID: w.ID, Market: market, Duration: duration,
 				CurrentPrice: snap.Price, TargetPrice: w.TargetPrice,
