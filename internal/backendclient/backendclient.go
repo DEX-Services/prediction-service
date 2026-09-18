@@ -69,6 +69,14 @@ func New() (*Client, error) {
 	}, nil
 }
 
+// NewForTest builds a Client pointed at an arbitrary base URL/secret/http
+// client, for tests (e.g. internal/round) that need to stub Dex-Backend's
+// balance endpoints without depending on unexported fields or env vars —
+// mirrors matching-engine's engineclient.NewForTest.
+func NewForTest(baseURL, secret string, httpClient *http.Client) *Client {
+	return &Client{baseURL: baseURL, secret: secret, http: httpClient}
+}
+
 type ensureUserReq struct {
 	UserID string `json:"userId"`
 }
