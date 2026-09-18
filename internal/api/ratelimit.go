@@ -61,6 +61,21 @@ func (s *limiterStore) reapLoop() {
 	}
 }
 
+// maxBodyBytes caps every request body (M2): no handler in this service set
+// any body-size limit before this.
+const maxBodyBytes = 1 << 20
+
+// MaxBody wraps next so every request body is capped at maxBodyBytes;
+// /prediction/ws is exempt for the same reason RateLimit exempts it.
+func MaxBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/prediction/ws" {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // RateLimit wraps next with a per-client-IP token bucket: 20 req/sec
 // sustained, burst of 40 — the trade ticket's fast polling during an active
 // round stays well under this; a scripted order-spam loop does not. /ws is

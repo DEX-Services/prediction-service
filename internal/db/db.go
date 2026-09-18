@@ -35,6 +35,7 @@ func Connect(ctx context.Context, uri string) (*pgxpool.Pool, error) {
 		{"prediction positions table", ensurePositionsTable},
 		{"prediction fills table", ensureFillsTable},
 		{"prediction settlements table", ensureSettlementsTable},
+		{"prediction positions paid_out column", addPositionsPaidOutColumn},
 	}
 	for _, m := range migrations {
 		if _, err := pool.Exec(ctx, m.sql); err != nil {
@@ -111,6 +112,14 @@ CREATE TABLE IF NOT EXISTS prediction_positions (
 );
 CREATE INDEX IF NOT EXISTS idx_prediction_positions_user
     ON prediction_positions (user_id, updated_at DESC);
+`
+
+// addPositionsPaidOutColumn backs PRED-M2's idempotent settlement payout: a
+// winning position is only ever Credit()-ed once, resumable if the
+// settlement loop crashes or a single Credit call fails partway through a
+// window's payout run.
+const addPositionsPaidOutColumn = `
+ALTER TABLE prediction_positions ADD COLUMN IF NOT EXISTS paid_out BOOLEAN NOT NULL DEFAULT false;
 `
 
 const ensureFillsTable = `

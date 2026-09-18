@@ -424,7 +424,7 @@ func (r *Repo) UpsertPosition(ctx context.Context, tx pgx.Tx, windowID int64, us
 
 func scanPosition(row pgx.Row) (*models.Position, error) {
 	p := &models.Position{}
-	err := row.Scan(&p.ID, &p.WindowID, &p.UserID, &p.Side, &p.Shares, &p.AvgPrice, &p.Realized, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.WindowID, &p.UserID, &p.Side, &p.Shares, &p.AvgPrice, &p.Realized, &p.PaidOut, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -434,7 +434,19 @@ func scanPosition(row pgx.Row) (*models.Position, error) {
 	return p, nil
 }
 
-const positionCols = `id, window_id, user_id, side, shares, avg_price, realized, created_at, updated_at`
+const positionCols = `id, window_id, user_id, side, shares, avg_price, realized, paid_out, created_at, updated_at`
+
+// MarkPositionPaid flips paid_out to true for one position, only if it
+// isn't already — the guard that makes settlement payout resumable: a
+// retried settlement run skips any position this returns false for (already
+// paid), instead of Credit()-ing it a second time.
+func (r *Repo) MarkPositionPaid(ctx context.Context, positionID int64) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `UPDATE prediction_positions SET paid_out = true WHERE id = $1 AND paid_out = false`, positionID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
 
 // PositionsForWindow returns all positions in a window, for settlement payout.
 func (r *Repo) PositionsForWindow(ctx context.Context, windowID int64) ([]*models.Position, error) {

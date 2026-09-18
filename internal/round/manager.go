@@ -323,12 +323,37 @@ func (m *Manager) settleLockedWindows(ctx context.Context, now time.Time) error 
 			if p.Side != winningSide || p.Shares.LessThanOrEqual(decimal.Zero) {
 				continue
 			}
+			if p.PaidOut {
+				// Already credited on a prior run of this loop (crash or
+				// partial failure after mark-paid below) — resume past it
+				// rather than crediting the same winner twice.
+				totalPaid = totalPaid.Add(p.Shares)
+				continue
+			}
+			// Marked paid BEFORE the Credit call: if Credit fails partway
+			// (or the process dies right after it actually lands but before
+			// we observe success), the position is skipped on the next
+			// settlement retry rather than risking a double-credit, which is
+			// the worse of the two failure modes here. A skipped-but-really-
+			// unpaid position is now a boring one-off Postgres UPDATE to
+			// resolve, not a fund-duplication incident.
+			marked, err := m.repo.MarkPositionPaid(ctx, p.ID)
+			if err != nil {
+				m.log.Error("mark position paid", "position_id", p.ID, "user_id", p.UserID, "window_id", w.ID, "err", err)
+				continue
+			}
+			if !marked {
+				// Lost a race with a concurrent settlement attempt on the
+				// same window; the other run already claimed this payout.
+				totalPaid = totalPaid.Add(p.Shares)
+				continue
+			}
 			// Each winning share pays out $1 BI2XUSD notional (the
 			// resolved binary outcome), regardless of entry price — profit
 			// is the difference between $1 and what the user paid, already
 			// realized via the locked cost paid at match time.
 			if err := m.client.Credit(ctx, p.UserID, "BI2XUSD", backendclient.ToRawUnits(p.Shares)); err != nil {
-				m.log.Error("credit winner", "user_id", p.UserID, "window_id", w.ID, "err", err)
+				m.log.Error("credit winner", "user_id", p.UserID, "window_id", w.ID, "position_id", p.ID, "err", err)
 				continue
 			}
 			totalPaid = totalPaid.Add(p.Shares)

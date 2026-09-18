@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/shopspring/decimal"
 
@@ -249,6 +250,14 @@ func (s *Server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	order := &models.Order{WindowID: req.WindowID, UserID: claims.UserID, Side: side, Price: price, Size: size}
 	id, fills, err := s.matcher.PlaceOrder(r.Context(), order)
 	if err != nil {
+		if strings.Contains(err.Error(), "status 409") {
+			// Dex-Backend's /internal/balance/lock returns 409 specifically
+			// for insufficient available balance (see LockBalance) — surface
+			// that to the user instead of a generic 500, same as
+			// handleSellPosition already does for its own matcher errors.
+			writeError(w, http.StatusConflict, "insufficient balance")
+			return
+		}
 		s.log.Error("place order", "err", err, "user_id", claims.UserID)
 		writeError(w, http.StatusInternalServerError, "failed to place order")
 		return

@@ -135,6 +135,7 @@ type Position struct {
 	Shares    decimal.Decimal // total contract size held
 	AvgPrice  decimal.Decimal // size-weighted average entry price
 	Realized  decimal.Decimal // realized P/L from any early exits already settled
+	PaidOut   bool            // settlement payout already Credit()-ed (idempotency guard)
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
