@@ -366,6 +366,13 @@ func (s *Server) handleUserOrders(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load orders")
 		return
 	}
+	if orders == nil {
+		// Go marshals a nil slice as JSON null, not []; a user with zero
+		// orders would previously get getPredictionOrders() === null from
+		// the frontend instead of an empty array, forcing every caller to
+		// null-check rather than just iterate.
+		orders = []*models.Order{}
+	}
 	writeJSON(w, http.StatusOK, orders)
 }
 
