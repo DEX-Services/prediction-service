@@ -49,10 +49,24 @@ type fakeBackend struct {
 	mu       sync.Mutex
 	balances map[string]decimal.Decimal // key: userID+"|"+asset
 	fees     map[string]decimal.Decimal // key: userID+"|"+asset, cumulative fee revenue
+	calls    map[string]int             // key: op+"|"+userID+"|"+asset, call count (used by manager_test.go)
 }
 
 func newFakeBackend() *fakeBackend {
-	return &fakeBackend{balances: map[string]decimal.Decimal{}, fees: map[string]decimal.Decimal{}}
+	return &fakeBackend{balances: map[string]decimal.Decimal{}, fees: map[string]decimal.Decimal{}, calls: map[string]int{}}
+}
+
+func (f *fakeBackend) callCount(op, userID, asset string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[op+"|"+f.key(userID, asset)]
+}
+
+func (f *fakeBackend) unlockCallCount(userID, asset string) int {
+	return f.callCount("unlock", userID, asset)
+}
+func (f *fakeBackend) creditCallCount(userID, asset string) int {
+	return f.callCount("credit", userID, asset)
 }
 
 // rawUnits mirrors backendclient.ToRawUnits(amount) but parses the result
@@ -102,6 +116,7 @@ func (f *fakeBackend) server(t *testing.T) *httptest.Server {
 			}
 			f.mu.Lock()
 			key := f.key(req.UserID, req.Asset)
+			f.calls[op+"|"+key]++
 			switch op {
 			case "lock":
 				// Lock doesn't move the running balance in this fake — it
