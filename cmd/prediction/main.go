@@ -104,8 +104,11 @@ func main() {
 	server := api.NewServer(r, matcher, jwtIssuer, hub, historyStore, log)
 	corsOrigins := os.Getenv("WS_ALLOWED_ORIGINS")
 	httpServer := &http.Server{
-		Addr:    ":" + port,
-		Handler: api.CORS(corsOrigins, server.Routes()),
+		Addr:              ":" + port,
+		Handler:           api.CORS(corsOrigins, api.RateLimit(server.Routes())),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

@@ -265,6 +265,18 @@ func (m *Manager) lockDueWindows(ctx context.Context, now time.Time) error {
 	return nil
 }
 
+// settleStalenessDeadline bounds how long a locked window waits for a fresh
+// price before settling anyway with the last-known (stale) price, mirroring
+// revealGracePeriod's identical tradeoff at reveal time above. Without this,
+// a price feed outage left settlement stalled indefinitely: positions stayed
+// locked, winners unpaid, with no deadline and no alert anywhere in the
+// loop — the window would just sit in "locked" forever, `continue`-ing past
+// itself every tick until the feed happened to recover. Longer than
+// revealGracePeriod (5s) because settlement is the financially final
+// action determining every position's payout, so it's worth waiting
+// meaningfully longer for a genuinely fresh price before falling back.
+const settleStalenessDeadline = 2 * time.Minute
+
 func (m *Manager) settleLockedWindows(ctx context.Context, now time.Time) error {
 	windows, err := m.repo.LockedWindows(ctx)
 	if err != nil {
@@ -273,7 +285,20 @@ func (m *Manager) settleLockedWindows(ctx context.Context, now time.Time) error 
 	for _, w := range windows {
 		snap := m.prices.Get(ctx, string(w.Market), now.UnixMilli())
 		if !snap.Fresh {
-			continue // wait for a fresh tick before resolving
+			waited := now.Sub(w.EndTime)
+			if waited < settleStalenessDeadline || !snap.Price.IsPositive() {
+				// Still within the normal settlement window, or there's no
+				// price at all to fall back to (feed genuinely never
+				// published this asset) — keep retrying next tick, same as
+				// openDueCommits' identical wait.
+				if waited >= settleStalenessDeadline {
+					m.log.Error("settlement stalled: no price at all to fall back to, still retrying",
+						"window_id", w.ID, "market", w.Market, "waited", waited)
+				}
+				continue
+			}
+			m.log.Warn("settling with stale price after deadline; price feed may be down",
+				"window_id", w.ID, "market", w.Market, "waited", waited, "price_age_ms", snap.AgeMs)
 		}
 
 		winningSide := models.SideNo
