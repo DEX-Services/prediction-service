@@ -36,6 +36,7 @@ func Connect(ctx context.Context, uri string) (*pgxpool.Pool, error) {
 		{"prediction fills table", ensureFillsTable},
 		{"prediction settlements table", ensureSettlementsTable},
 		{"prediction positions paid_out column", addPositionsPaidOutColumn},
+		{"prediction pending fills table", ensurePendingFillsTable},
 	}
 	for _, m := range migrations {
 		if _, err := pool.Exec(ctx, m.sql); err != nil {
@@ -136,6 +137,36 @@ CREATE TABLE IF NOT EXISTS prediction_fills (
 );
 CREATE INDEX IF NOT EXISTS idx_prediction_fills_window
     ON prediction_fills (window_id, created_at);
+`
+
+// ensurePendingFillsTable backs M7/PRED-H2's crash-safe settlement: a row is
+// written in the same short transaction that marks both orders filled
+// (before any HTTP call to Dex-Backend), and deleted only after the
+// Credit/SettleFee calls and the position/fill writes for that match all
+// succeed. A row that outlives a short grace period means the process died
+// or a backend call failed between those two points — settleFillRow's
+// reconciliation sweep (round/reconcile.go) finds it and retries the
+// settlement from scratch, using idempotency_key so a retry can't double
+// -apply if the original HTTP calls actually landed before the failure.
+const ensurePendingFillsTable = `
+CREATE TABLE IF NOT EXISTS prediction_pending_fills (
+    id                BIGSERIAL PRIMARY KEY,
+    window_id         BIGINT NOT NULL REFERENCES prediction_windows(id),
+    maker_order_id    BIGINT NOT NULL REFERENCES prediction_orders(id),
+    taker_order_id    BIGINT NOT NULL REFERENCES prediction_orders(id),
+    maker_user_id     TEXT NOT NULL,
+    taker_user_id     TEXT NOT NULL,
+    maker_side        TEXT NOT NULL CHECK (maker_side IN ('yes', 'no')),
+    taker_side        TEXT NOT NULL CHECK (taker_side IN ('yes', 'no')),
+    exec_price        NUMERIC(6, 4) NOT NULL,
+    size              NUMERIC(38, 18) NOT NULL,
+    idempotency_key   TEXT NOT NULL UNIQUE,
+    attempts          INT NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_pending_fills_created
+    ON prediction_pending_fills (created_at);
 `
 
 const ensureSettlementsTable = `

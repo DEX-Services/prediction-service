@@ -155,6 +155,26 @@ type Fill struct {
 	CreatedAt    time.Time
 }
 
+// PendingFill is a not-yet-settled match: written durably before any
+// Dex-Backend HTTP call so a crash or failed call between "orders marked
+// filled" and "positions/fees recorded" can be found and retried instead of
+// silently leaving that fill unsettled forever (M7/PRED-H2).
+type PendingFill struct {
+	ID             int64
+	WindowID       int64
+	MakerOrderID   int64
+	TakerOrderID   int64
+	MakerUserID    string
+	TakerUserID    string
+	MakerSide      OrderSide
+	TakerSide      OrderSide
+	ExecPrice      decimal.Decimal
+	Size           decimal.Decimal
+	IdempotencyKey string
+	Attempts       int
+	CreatedAt      time.Time
+}
+
 // Settlement is the permanent resolution record for one window — target vs.
 // resolution price, the winning side, and the total paid out.
 type Settlement struct {

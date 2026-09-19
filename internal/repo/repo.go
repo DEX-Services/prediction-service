@@ -532,3 +532,64 @@ func (r *Repo) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	}
 	return tx.Commit(ctx)
 }
+
+// --- pending fills (M7/PRED-H2 crash-safe settlement) ---
+
+// CreatePendingFill records a match durably, inside the same short
+// transaction that marks both orders' filled_size/status — before any
+// Dex-Backend HTTP call. idempotencyKey is unique per match so a retry from
+// the reconciliation sweep can be sent to Dex-Backend safely even if an
+// earlier attempt's response was lost after the call actually landed.
+func (r *Repo) CreatePendingFill(ctx context.Context, tx pgx.Tx, pf *models.PendingFill) (int64, error) {
+	var id int64
+	err := tx.QueryRow(ctx, `
+		INSERT INTO prediction_pending_fills
+			(window_id, maker_order_id, taker_order_id, maker_user_id, taker_user_id, maker_side, taker_side, exec_price, size, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id
+	`, pf.WindowID, pf.MakerOrderID, pf.TakerOrderID, pf.MakerUserID, pf.TakerUserID, pf.MakerSide, pf.TakerSide, pf.ExecPrice, pf.Size, pf.IdempotencyKey).Scan(&id)
+	return id, err
+}
+
+// DeletePendingFill removes a pending-fill row once settlement (HTTP calls
+// plus position/fill writes) has fully succeeded.
+func (r *Repo) DeletePendingFill(ctx context.Context, id int64) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM prediction_pending_fills WHERE id = $1`, id)
+	return err
+}
+
+// StalePendingFills returns pending fills older than olderThan — matches
+// whose settlement never completed, either because the process died between
+// CreatePendingFill and DeletePendingFill or because a Dex-Backend call
+// failed. The age cutoff avoids racing a fill that's still being settled by
+// the request that just created it.
+func (r *Repo) StalePendingFills(ctx context.Context, olderThan time.Duration) ([]*models.PendingFill, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, window_id, maker_order_id, taker_order_id, maker_user_id, taker_user_id, maker_side, taker_side, exec_price, size, idempotency_key, attempts, created_at
+		FROM prediction_pending_fills
+		WHERE created_at < $1
+		ORDER BY created_at
+	`, time.Now().Add(-olderThan))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*models.PendingFill
+	for rows.Next() {
+		pf := &models.PendingFill{}
+		if err := rows.Scan(&pf.ID, &pf.WindowID, &pf.MakerOrderID, &pf.TakerOrderID, &pf.MakerUserID, &pf.TakerUserID, &pf.MakerSide, &pf.TakerSide, &pf.ExecPrice, &pf.Size, &pf.IdempotencyKey, &pf.Attempts, &pf.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, pf)
+	}
+	return out, rows.Err()
+}
+
+// RecordPendingFillAttempt increments the retry counter and stores the last
+// error, purely for observability — the sweep keeps retrying regardless.
+func (r *Repo) RecordPendingFillAttempt(ctx context.Context, id int64, lastErr string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE prediction_pending_fills SET attempts = attempts + 1, last_error = $2 WHERE id = $1
+	`, id, lastErr)
+	return err
+}

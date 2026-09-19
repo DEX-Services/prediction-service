@@ -117,6 +117,7 @@ func (m *Manager) tick(ctx context.Context, now time.Time) {
 	step("open due commits", func(c context.Context) error { return m.openDueCommits(c, now) })
 	step("lock due windows", func(c context.Context) error { return m.lockDueWindows(c, now) })
 	step("settle locked windows", func(c context.Context) error { return m.settleLockedWindows(c, now) })
+	step("reconcile pending fills", func(c context.Context) error { return m.reconcilePendingFills(c) })
 	// broadcastTicks no longer touches Postgres (see its comment), so it
 	// doesn't need the same timeout treatment — Redis calls it does make are
 	// already fast and non-blocking for the other steps regardless.

@@ -121,14 +121,14 @@ type balanceReq struct {
 // userID's real Postgres balance without yet debiting it, for an order
 // resting on the book.
 func (c *Client) Lock(ctx context.Context, userID, asset, amount string) error {
-	return c.call(ctx, "/internal/balance/lock", userID, asset, amount)
+	return c.call(ctx, "/internal/balance/lock", userID, asset, amount, "")
 }
 
 // Unlock calls POST /internal/balance/unlock — releases a hold taken by
 // Lock, e.g. when an order is cancelled or a round refunds an unfilled
 // order.
 func (c *Client) Unlock(ctx context.Context, userID, asset, amount string) error {
-	return c.call(ctx, "/internal/balance/unlock", userID, asset, amount)
+	return c.call(ctx, "/internal/balance/unlock", userID, asset, amount, "")
 }
 
 // Credit calls POST /internal/balance/credit — a generic signed adjustment
@@ -139,7 +139,17 @@ func (c *Client) Unlock(ctx context.Context, userID, asset, amount string) error
 // hold is actually spent), and round settlement pays winners via a positive
 // Credit.
 func (c *Client) Credit(ctx context.Context, userID, asset, amount string) error {
-	return c.call(ctx, "/internal/balance/credit", userID, asset, amount)
+	return c.call(ctx, "/internal/balance/credit", userID, asset, amount, "")
+}
+
+// CreditIdempotent is Credit with an Idempotency-Key header attached, for
+// callers that may retry the same logical operation (M7/PRED-H2's
+// reconciliation sweep). Dex-Backend dedupes on (endpoint, key): a retry with
+// the same key and the same userID/asset/amount is a safe no-op even if the
+// original call already landed — see LedgerRepo.CreditBalanceIdempotent in
+// Dex-Backend/internal/repo/ledger.go.
+func (c *Client) CreditIdempotent(ctx context.Context, userID, asset, amount, idempotencyKey string) error {
+	return c.call(ctx, "/internal/balance/credit", userID, asset, amount, idempotencyKey)
 }
 
 type feeSettleReq struct {
@@ -158,6 +168,16 @@ type feeSettleReq struct {
 // InternalSettleFee handler to accept "prediction" — see
 // ensureTreasuryEntryPredictionCategory in Dex-Backend/internal/db/db.go.
 func (c *Client) SettleFee(ctx context.Context, userID, asset, amount string) error {
+	return c.settleFee(ctx, userID, asset, amount, "")
+}
+
+// SettleFeeIdempotent is SettleFee with an Idempotency-Key header attached;
+// see CreditIdempotent's doc comment for the dedup guarantee this gives.
+func (c *Client) SettleFeeIdempotent(ctx context.Context, userID, asset, amount, idempotencyKey string) error {
+	return c.settleFee(ctx, userID, asset, amount, idempotencyKey)
+}
+
+func (c *Client) settleFee(ctx context.Context, userID, asset, amount, idempotencyKey string) error {
 	body, err := json.Marshal(feeSettleReq{UserID: userID, Asset: asset, Amount: amount, Category: "prediction"})
 	if err != nil {
 		return err
@@ -168,6 +188,9 @@ func (c *Client) SettleFee(ctx context.Context, userID, asset, amount string) er
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Engine-Secret", c.secret)
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("backendclient /internal/balance/fee: %w", err)
@@ -212,7 +235,7 @@ func (c *Client) AvailableBalance(ctx context.Context, userID, asset string) (st
 	return result.Available, nil
 }
 
-func (c *Client) call(ctx context.Context, path, userID, asset, amount string) error {
+func (c *Client) call(ctx context.Context, path, userID, asset, amount, idempotencyKey string) error {
 	body, err := json.Marshal(balanceReq{UserID: userID, Asset: asset, Amount: amount})
 	if err != nil {
 		return err
@@ -223,6 +246,9 @@ func (c *Client) call(ctx context.Context, path, userID, asset, amount string) e
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Engine-Secret", c.secret)
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("backendclient %s: %w", path, err)
