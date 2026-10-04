@@ -205,7 +205,7 @@ func TestManager_LockDueWindows_RefundsUnfilledOrderAndCommitsNext(t *testing.T)
 		t.Fatalf("unfilled order Status = %v, want cancelled after lock-time refund", closedOrder.Status)
 	}
 
-	if fb.unlockCallCount(userID, "BI2XUSD") == 0 {
+	if fb.unlockCallCount(userID) == 0 {
 		t.Fatal("lockDueWindows did not call Unlock for the unfilled order's remainder")
 	}
 
@@ -264,8 +264,8 @@ func TestManager_SettleLockedWindows_PaysWinnerAndSkipsAlreadyPaid(t *testing.T)
 	if !pos.PaidOut {
 		t.Fatal("winning position PaidOut = false after settlement")
 	}
-	if fb.creditCallCount(winnerID, "BI2XUSD") != 1 {
-		t.Fatalf("Credit called %d times for the winner, want exactly 1", fb.creditCallCount(winnerID, "BI2XUSD"))
+	if fb.creditCallCount(winnerID) != 1 {
+		t.Fatalf("Credit called %d times for the winner, want exactly 1", fb.creditCallCount(winnerID))
 	}
 
 	// Re-running settlement should be a no-op — LockedWindows no longer
@@ -275,7 +275,7 @@ func TestManager_SettleLockedWindows_PaysWinnerAndSkipsAlreadyPaid(t *testing.T)
 	if err := m.settleLockedWindows(context.Background(), time.Now()); err != nil {
 		t.Fatalf("settleLockedWindows (second call): %v", err)
 	}
-	if fb.creditCallCount(winnerID, "BI2XUSD") != 1 {
-		t.Fatalf("Credit called %d times after a second settlement pass, want still exactly 1 (no double-pay)", fb.creditCallCount(winnerID, "BI2XUSD"))
+	if fb.creditCallCount(winnerID) != 1 {
+		t.Fatalf("Credit called %d times after a second settlement pass, want still exactly 1 (no double-pay)", fb.creditCallCount(winnerID))
 	}
 }

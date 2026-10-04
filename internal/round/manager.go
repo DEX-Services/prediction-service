@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
 	"github.com/dex/prediction-service/internal/backendclient"
@@ -235,7 +236,10 @@ func (m *Manager) lockDueWindows(ctx context.Context, now time.Time) error {
 			if o.Side == models.SideNo {
 				refund = decimal.NewFromInt(1).Sub(o.Price).Mul(remaining)
 			}
-			if err := m.client.Unlock(ctx, o.UserID, "BI2XUSD", backendclient.ToRawUnits(refund)); err != nil {
+			// positionRef is a fresh trace tag (see Matcher.Lock's doc
+			// comment) — the window-lock refund path has no persisted ref
+			// from the original order-placement Lock call to reuse.
+			if err := m.client.Unlock(ctx, o.UserID, "window-refund:"+uuid.NewString(), backendclient.ToRawUnits(refund)); err != nil {
 				m.log.Error("unlock unfilled remainder", "order_id", o.ID, "err", err)
 				continue
 			}
@@ -352,8 +356,13 @@ func (m *Manager) settleLockedWindows(ctx context.Context, now time.Time) error 
 			// Each winning share pays out $1 BI2XUSD notional (the
 			// resolved binary outcome), regardless of entry price — profit
 			// is the difference between $1 and what the user paid, already
-			// realized via the locked cost paid at match time.
-			if err := m.client.Credit(ctx, p.UserID, "BI2XUSD", backendclient.ToRawUnits(p.Shares)); err != nil {
+			// realized via the locked cost paid at match time. positionRef
+			// and the idempotency key both use the position's own ID
+			// (stable across a settlement retry after MarkPositionPaid's
+			// own guard above), belt-and-suspenders with that guard rather
+			// than relying on it alone.
+			positionRef := fmt.Sprintf("settle:%d", p.ID)
+			if err := m.client.CreditIdempotent(ctx, p.UserID, positionRef, backendclient.ToRawUnits(p.Shares), positionRef); err != nil {
 				m.log.Error("credit winner", "user_id", p.UserID, "window_id", w.ID, "position_id", p.ID, "err", err)
 				continue
 			}

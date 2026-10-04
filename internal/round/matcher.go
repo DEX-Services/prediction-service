@@ -60,13 +60,18 @@ func (m *Matcher) PlaceOrder(ctx context.Context, o *models.Order) (int64, []*mo
 		cost = decimal.NewFromInt(1).Sub(o.Price).Mul(o.Size)
 	}
 	rawCost := backendclient.ToRawUnits(cost)
-	if err := m.client.Lock(ctx, o.UserID, "BI2XUSD", rawCost); err != nil {
+	// positionRef is generated before the order has a real ID (CreateOrder
+	// below assigns that) since Lock needs something to tag the wallet
+	// entry with now — a fresh UUID is fine, it's purely an operational
+	// trace tag (see backendclient.Lock's doc comment), not looked up later.
+	positionRef := uuid.NewString()
+	if err := m.client.Lock(ctx, o.UserID, positionRef, rawCost); err != nil {
 		return 0, nil, fmt.Errorf("lock order cost: %w", err)
 	}
 
 	orderID, err := m.repo.CreateOrder(ctx, o)
 	if err != nil {
-		_ = m.client.Unlock(ctx, o.UserID, "BI2XUSD", rawCost)
+		_ = m.client.Unlock(ctx, o.UserID, positionRef, rawCost)
 		return 0, nil, fmt.Errorf("create order: %w", err)
 	}
 	o.ID = orderID
@@ -210,14 +215,17 @@ func (m *Matcher) settleFillByPlan(ctx context.Context, pf *models.PendingFill) 
 	// Consume the locked hold: the lock was taken at order-placement price,
 	// which may differ slightly from execPrice for a maker whose resting
 	// price improved after being crossed; both sides only ever pay execPrice
-	// economics here, debited via a negative Credit against their lock.
-	// Each call carries pf.IdempotencyKey (plus a role suffix, since one
-	// pending fill needs 4 distinct backend calls) so a sweep retry can be
-	// told apart from the original attempt at the same logical operation.
-	if err := m.client.CreditIdempotent(ctx, pf.MakerUserID, "BI2XUSD", "-"+backendclient.ToRawUnits(makerCost.Add(makerFee)), pf.IdempotencyKey+":maker-debit"); err != nil {
+	// economics here, debited from their reserved prediction-wallet balance
+	// via Debit (Phase 4: no more negative-amount Credit against a shared
+	// main-wallet balance — this wallet's Debit draws specifically from
+	// reserved_raw, which is what Lock put the cost into). Each call
+	// carries pf.IdempotencyKey (plus a role suffix, since one pending fill
+	// needs 4 distinct backend calls) so a sweep retry can be told apart
+	// from the original attempt at the same logical operation.
+	if err := m.client.DebitIdempotent(ctx, pf.MakerUserID, pf.IdempotencyKey, backendclient.ToRawUnits(makerCost.Add(makerFee)), pf.IdempotencyKey+":maker-debit"); err != nil {
 		return fmt.Errorf("debit maker: %w", err)
 	}
-	if err := m.client.CreditIdempotent(ctx, pf.TakerUserID, "BI2XUSD", "-"+backendclient.ToRawUnits(takerCost.Add(takerFee)), pf.IdempotencyKey+":taker-debit"); err != nil {
+	if err := m.client.DebitIdempotent(ctx, pf.TakerUserID, pf.IdempotencyKey, backendclient.ToRawUnits(takerCost.Add(takerFee)), pf.IdempotencyKey+":taker-debit"); err != nil {
 		return fmt.Errorf("debit taker: %w", err)
 	}
 	if err := m.client.SettleFeeIdempotent(ctx, pf.MakerUserID, "BI2XUSD", backendclient.ToRawUnits(makerFee), pf.IdempotencyKey+":maker-fee"); err != nil {
@@ -299,5 +307,9 @@ func (m *Matcher) CancelOrder(ctx context.Context, orderID int64, userID string,
 	if side == models.SideNo {
 		refund = decimal.NewFromInt(1).Sub(price).Mul(remaining)
 	}
-	return m.client.Unlock(ctx, userID, "BI2XUSD", backendclient.ToRawUnits(refund))
+	// positionRef here is just a fresh trace tag (see Lock's doc comment) —
+	// the original lock's own ref wasn't persisted on the order row, and
+	// Unlock doesn't need to match it to work correctly, only the amount
+	// matters for the balance movement itself.
+	return m.client.Unlock(ctx, userID, "cancel:"+uuid.NewString(), backendclient.ToRawUnits(refund))
 }

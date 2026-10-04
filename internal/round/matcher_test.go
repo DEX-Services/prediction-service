@@ -41,32 +41,36 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// fakeBackend is an in-memory stand-in for Dex-Backend's /internal/balance/*
-// endpoints, tracking one running signed balance per user+asset so a test
-// can assert the exact economics a real fill produced (locked cost debited,
-// fees collected) without needing a live Dex-Backend instance.
+// fakeBackend is an in-memory stand-in for Dex-Backend's
+// /internal/prediction-wallet/* and /internal/balance/fee endpoints (Phase
+// 4 of ~/.claude/plans/wallet-separation.md), tracking one running signed
+// balance per user so a test can assert the exact economics a real fill
+// produced (locked cost debited, fees collected) without needing a live
+// Dex-Backend instance. Keyed by userID alone now — the prediction wallet
+// is BI2XUSD-only, so there's no asset dimension left to key on (unlike the
+// old direct-main-wallet design this replaces).
 type fakeBackend struct {
 	mu       sync.Mutex
-	balances map[string]decimal.Decimal // key: userID+"|"+asset
-	fees     map[string]decimal.Decimal // key: userID+"|"+asset, cumulative fee revenue
-	calls    map[string]int             // key: op+"|"+userID+"|"+asset, call count (used by manager_test.go)
+	balances map[string]decimal.Decimal // key: userID
+	fees     map[string]decimal.Decimal // key: userID, cumulative fee revenue
+	calls    map[string]int             // key: op+"|"+userID, call count (used by manager_test.go)
 }
 
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{balances: map[string]decimal.Decimal{}, fees: map[string]decimal.Decimal{}, calls: map[string]int{}}
 }
 
-func (f *fakeBackend) callCount(op, userID, asset string) int {
+func (f *fakeBackend) callCount(op, userID string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.calls[op+"|"+f.key(userID, asset)]
+	return f.calls[op+"|"+userID]
 }
 
-func (f *fakeBackend) unlockCallCount(userID, asset string) int {
-	return f.callCount("unlock", userID, asset)
+func (f *fakeBackend) unlockCallCount(userID string) int {
+	return f.callCount("unlock", userID)
 }
-func (f *fakeBackend) creditCallCount(userID, asset string) int {
-	return f.callCount("credit", userID, asset)
+func (f *fakeBackend) creditCallCount(userID string) int {
+	return f.callCount("credit", userID)
 }
 
 // rawUnits mirrors backendclient.ToRawUnits(amount) but parses the result
@@ -82,18 +86,16 @@ func rawUnits(t *testing.T, amount decimal.Decimal) decimal.Decimal {
 	return d
 }
 
-func (f *fakeBackend) key(userID, asset string) string { return userID + "|" + asset }
-
-func (f *fakeBackend) balance(userID, asset string) decimal.Decimal {
+func (f *fakeBackend) balance(userID string) decimal.Decimal {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.balances[f.key(userID, asset)]
+	return f.balances[userID]
 }
 
-func (f *fakeBackend) fee(userID, asset string) decimal.Decimal {
+func (f *fakeBackend) fee(userID string) decimal.Decimal {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.fees[f.key(userID, asset)]
+	return f.fees[userID]
 }
 
 func (f *fakeBackend) server(t *testing.T) *httptest.Server {
@@ -102,9 +104,9 @@ func (f *fakeBackend) server(t *testing.T) *httptest.Server {
 	mux.HandleFunc("/internal/user/ensure", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	handleBalanceOp := func(op string) http.HandlerFunc {
+	handleWalletOp := func(op string) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			var req struct{ UserID, Asset, Amount string }
+			var req struct{ UserID, PositionRef, Amount string }
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -115,31 +117,47 @@ func (f *fakeBackend) server(t *testing.T) *httptest.Server {
 				return
 			}
 			f.mu.Lock()
-			key := f.key(req.UserID, req.Asset)
-			f.calls[op+"|"+key]++
+			f.calls[op+"|"+req.UserID]++
 			switch op {
 			case "lock":
 				// Lock doesn't move the running balance in this fake — it
 				// only needs to succeed so PlaceOrder proceeds; the actual
-				// economics land via the signed Credit call in settleFill,
-				// mirroring how Dex-Backend's real lock/credit split works
-				// (lock reserves, a later signed credit is what actually
-				// moves the number this test asserts on).
+				// economics land via the Debit call in settleFill,
+				// mirroring how Dex-Backend's real lock/debit split works
+				// (lock reserves, a later debit is what actually moves the
+				// number this test asserts on).
+			case "debit":
+				f.balances[req.UserID] = f.balances[req.UserID].Sub(amt)
 			case "credit":
-				f.balances[key] = f.balances[key].Add(amt)
-			case "fee":
-				f.fees[key] = f.fees[key].Add(amt)
+				f.balances[req.UserID] = f.balances[req.UserID].Add(amt)
 			}
 			f.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 		}
 	}
-	mux.HandleFunc("/internal/balance/lock", handleBalanceOp("lock"))
-	mux.HandleFunc("/internal/balance/unlock", handleBalanceOp("unlock"))
-	mux.HandleFunc("/internal/balance/credit", handleBalanceOp("credit"))
-	mux.HandleFunc("/internal/balance/fee", handleBalanceOp("fee"))
-	mux.HandleFunc("/internal/balance/available", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/internal/prediction-wallet/lock", handleWalletOp("lock"))
+	mux.HandleFunc("/internal/prediction-wallet/unlock", handleWalletOp("unlock"))
+	mux.HandleFunc("/internal/prediction-wallet/debit", handleWalletOp("debit"))
+	mux.HandleFunc("/internal/prediction-wallet/credit", handleWalletOp("credit"))
+	mux.HandleFunc("/internal/prediction-wallet/available", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"available": "1000000"})
+	})
+	mux.HandleFunc("/internal/balance/fee", func(w http.ResponseWriter, r *http.Request) {
+		var req struct{ UserID, Asset, Amount, Category string }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		amt, err := decimal.NewFromString(req.Amount)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		f.calls["fee|"+req.UserID]++
+		f.fees[req.UserID] = f.fees[req.UserID].Add(amt)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -220,8 +238,8 @@ func TestMatcher_PlaceOrder_MatchesAndSettlesFillEconomics(t *testing.T) {
 	wantMakerDebit := rawUnits(t, decimal.NewFromFloat(60).Add(decimal.NewFromFloat(60).Mul(makerFeeRate))).Neg()
 	wantTakerDebit := rawUnits(t, decimal.NewFromFloat(40).Add(decimal.NewFromFloat(40).Mul(takerFeeRate))).Neg()
 
-	gotMakerBalance := fb.balance(makerID, "BI2XUSD")
-	gotTakerBalance := fb.balance(takerID, "BI2XUSD")
+	gotMakerBalance := fb.balance(makerID)
+	gotTakerBalance := fb.balance(takerID)
 	if !gotMakerBalance.Equal(wantMakerDebit) {
 		t.Errorf("maker balance = %s, want %s", gotMakerBalance, wantMakerDebit)
 	}
@@ -231,11 +249,11 @@ func TestMatcher_PlaceOrder_MatchesAndSettlesFillEconomics(t *testing.T) {
 
 	wantMakerFee := rawUnits(t, decimal.NewFromFloat(60).Mul(makerFeeRate))
 	wantTakerFee := rawUnits(t, decimal.NewFromFloat(40).Mul(takerFeeRate))
-	if !fb.fee(makerID, "BI2XUSD").Equal(wantMakerFee) {
-		t.Errorf("maker fee collected = %s, want %s", fb.fee(makerID, "BI2XUSD"), wantMakerFee)
+	if !fb.fee(makerID).Equal(wantMakerFee) {
+		t.Errorf("maker fee collected = %s, want %s", fb.fee(makerID), wantMakerFee)
 	}
-	if !fb.fee(takerID, "BI2XUSD").Equal(wantTakerFee) {
-		t.Errorf("taker fee collected = %s, want %s", fb.fee(takerID, "BI2XUSD"), wantTakerFee)
+	if !fb.fee(takerID).Equal(wantTakerFee) {
+		t.Errorf("taker fee collected = %s, want %s", fb.fee(takerID), wantTakerFee)
 	}
 
 	// Both orders should now show as fully filled — verifies FillOrder's
