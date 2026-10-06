@@ -17,7 +17,22 @@ import (
 // inline-Go-string migration pattern already used in Dex-Backend and
 // matching-engine (no separate migration framework/files in this codebase).
 func Connect(ctx context.Context, uri string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, uri)
+	// Explicitly cap pool size: this service shares one Aiven Postgres
+	// instance with a hard 25-connection limit (dropped from 100,
+	// 2026-10-06 — see Dex-Backend's internal/db/db.go for the full
+	// rebalanced split: backend 10, matching-engine 6, bots 4, this
+	// service 4, 1 spare). Without an explicit MaxConns, pgxpool.New
+	// defaults to max(4, NumCPU()) per process, unbounded relative to the
+	// shared limit on larger deploy hosts — this was previously completely
+	// uncapped, a real contributor to repeated pool-exhaustion errors
+	// ("remaining connection slots are reserved for roles with the
+	// SUPERUSER attribute") alongside Dex-Backend's own over-budget cap.
+	cfg, err := pgxpool.ParseConfig(uri)
+	if err != nil {
+		return nil, fmt.Errorf("db connect: %w", err)
+	}
+	cfg.MaxConns = 4
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("db connect: %w", err)
 	}
